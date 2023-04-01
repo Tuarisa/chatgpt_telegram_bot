@@ -45,6 +45,7 @@ HELP_MESSAGE = """Commands:
 ⚪ /retry – Regenerate last bot answer
 ⚪ /new – Start new dialog
 ⚪ /mode – Select chat mode
+⚪ /imagine <prompt> – Generate an image
 ⚪ /settings – Show settings
 ⚪ /balance – Show balance
 ⚪ /help – Show help
@@ -57,6 +58,10 @@ def split_text_into_chunks(text, chunk_size):
 
 
 async def register_user_if_not_exists(update: Update, context: CallbackContext, user: User):
+    if update.message.chat.type != "private":
+        await register_muc_if_not_exists(update, context, update.message.chat)
+        return
+
     if not db.check_if_user_exists(user.id):
         db.add_new_user(
             user.id,
@@ -64,6 +69,40 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
             username=user.username,
             first_name=user.first_name,
             last_name= user.last_name
+        )
+        db.start_new_dialog(user.id)
+
+    if db.get_user_attribute(user.id, "current_dialog_id") is None:
+        db.start_new_dialog(user.id)
+
+    if user.id not in user_semaphores:
+        user_semaphores[user.id] = asyncio.Semaphore(1)
+
+    if db.get_user_attribute(user.id, "current_model") is None:
+        db.set_user_attribute(user.id, "current_model", config.models["available_text_models"][0])
+
+    # back compatibility for n_used_tokens field
+    n_used_tokens = db.get_user_attribute(user.id, "n_used_tokens")
+    if isinstance(n_used_tokens, int):  # old format
+        new_n_used_tokens = {
+            "gpt-3.5-turbo": {
+                "n_input_tokens": 0,
+                "n_output_tokens": n_used_tokens
+            }
+        }
+        db.set_user_attribute(user.id, "n_used_tokens", new_n_used_tokens)
+
+    # voice message transcription
+    if db.get_user_attribute(user.id, "n_transcribed_seconds") is None:
+        db.set_user_attribute(user.id, "n_transcribed_seconds", 0.0)
+
+async def register_muc_if_not_exists(update: Update, context: CallbackContext, user: User):
+    if not db.check_if_user_exists(user.id):
+        db.add_new_user(
+            user.id,
+            update.message.chat_id,
+            username=user.username,
+            first_name=update.message.chat.title,
         )
         db.start_new_dialog(user.id)
 
@@ -132,16 +171,39 @@ async def retry_handle(update: Update, context: CallbackContext):
     await message_handle(update, context, message=last_dialog_message["user"], use_new_dialog_timeout=False)
 
 
+async def bot_is_mentioned(update: Update, context: CallbackContext):
+    message = update.message
+
+    if message.chat.type == "private":
+        return True
+
+    # Проверяем, является ли сообщение упоминанием бота.
+    if message.entities and message.entities[0].type == 'mention' and message.entities[0].offset == 0:
+        return True
+
+    # Проверяем, является ли сообщение ответом на сообщение бота.
+    if message.reply_to_message:
+        reply = message.reply_to_message
+        if reply.from_user.id == context.bot.id and reply.text != message.text:
+            return True
+
+    return False
+
 async def message_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
     # check if message is edited
     if update.edited_message is not None:
-        await edited_message_handle(update, context)
+        # await edited_message_handle(update, context)
         return
+
+    if not await bot_is_mentioned(update, context): return
 
     await register_user_if_not_exists(update, context, update.message.from_user)
     if await is_previous_message_not_answered_yet(update, context): return
 
     user_id = update.message.from_user.id
+    if update.message.chat.type != "private":
+        user_id = update.message.chat.id
+
     async def message_handle_fn():
         chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
 
@@ -251,11 +313,38 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             if user_id in user_tasks:
                 del user_tasks[user_id]
 
+async def image_generation_handle(update: Update, context: CallbackContext):
+     await register_user_if_not_exists(update, context, update.message.from_user)
+     user_id = update.message.from_user.id
+     db.set_user_attribute(user_id, "last_interaction", datetime.now())
+
+     if len(context.args) == 0:
+         await update.message.reply_text("Please, specify the image caption")
+         return
+
+     # get image caption
+     caption = " ".join(context.args)
+
+     # generate image
+     image_url = await openai_utils.generate_image(caption)
+
+     if image_url is None:
+         await update.message.reply_text("Something went wrong during image generation. It's possible that your request not allowed by openai's safety system.")
+         return
+
+     # send image
+     await update.message.reply_photo(image_url, caption=caption)
+
+     # normalize dollars to tokens (it's very convenient to measure everything in a single unit)
+     # db.set_user_attribute(user_id, "n_used_tokens", config.dalle_price_per_image + db.get_user_attribute(user_id, "n_used_tokens"))
+
 
 async def is_previous_message_not_answered_yet(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
 
     user_id = update.message.from_user.id
+    if update.message.chat.type != "private":
+        user_id = update.message.chat.id
     if user_semaphores[user_id].locked():
         text = "⏳ Please <b>wait</b> for a reply to the previous message\n"
         text += "Or you can /cancel it"
@@ -483,6 +572,7 @@ async def post_init(application: Application):
         BotCommand("/new", "Start new dialog"),
         BotCommand("/mode", "Select chat mode"),
         BotCommand("/retry", "Re-generate response for previous query"),
+        BotCommand("/imagine", "Generate an image"),
         BotCommand("/balance", "Show balance"),
         BotCommand("/settings", "Show settings"),
         BotCommand("/help", "Show help message"),
@@ -514,6 +604,8 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("cancel", cancel_handle, filters=user_filter))
 
     application.add_handler(MessageHandler(filters.VOICE & user_filter, voice_message_handle))
+
+    application.add_handler(CommandHandler("imagine", image_generation_handle, filters=user_filter))
 
     application.add_handler(CommandHandler("mode", show_chat_modes_handle, filters=user_filter))
     application.add_handler(CallbackQueryHandler(set_chat_mode_handle, pattern="^set_chat_mode"))
